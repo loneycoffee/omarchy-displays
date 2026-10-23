@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "displays-workspaces",
+  "name": "Workspaces per screen",
+  "version": "1.0.0",
+  "author": "loneycoffee",
+  "license": "MIT",
+  "description": "Companion of the displays plugin: each bar shows only the workspaces of its own screen (1-5 on the main screen, 6-0 on the other), behind a small laptop or monitor glyph, so it is obvious where each workspace opens.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Workspaces.qml"
+  },
+  "barWidget": {
+    "displayName": "Workspaces per screen",
+    "description": "This screen's workspaces only, from the displays plugin",
+    "category": "Workspaces",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

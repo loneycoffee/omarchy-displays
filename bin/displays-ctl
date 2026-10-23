@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""displays-ctl - workspaces per screen and quick display modes for Omarchy.
+
+  displays-ctl state                   JSON for the bar panel
+  displays-ctl apply                   rewrite the Hyprland rules, move workspaces
+  displays-ctl mode NAME WxH@HZ        switch a screen's mode
+  displays-ctl gaming NAME [HZ]        gaming mode: 1920x1080 at HZ (default: the
+                                       last rate used, first time 60)
+  displays-ctl normal NAME             back to the mode from monitors.lua
+  displays-ctl scale NAME SCALE        app scale, e.g. 1.25 (kept in monitors.lua)
+  displays-ctl keep NAME               keep a custom mode being tried
+  displays-ctl undo NAME               drop it now instead of waiting
+  displays-ctl primary NAME|auto       which screen gets workspaces 1-5
+  displays-ctl sync-companion          install or refresh the workspaces bar widget
+
+The primary screen gets workspaces 1-5 and the next one 6-10; unless chosen,
+the primary is the external screen, so plugging one in makes it the main
+screen. A mode stays until `normal` or the end of the session: everything lives
+in $XDG_RUNTIME_DIR/omarchy-displays, and ~/.config/hypr/custom.lua loads the
+generated hyprland.lua so the rules survive Hyprland reloads.
+
+Besides the modes a screen reports, the common resolutions and refresh rates it
+can plausibly drive are offered too. Hyprland builds those as custom modes,
+which a screen may refuse or show black, so they go back on their own after
+15 seconds unless kept.
+"""
+
+import json
+import math
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+
+RUNTIME_DIR = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "omarchy-displays"
+)
+STATE_PATH = os.path.join(RUNTIME_DIR, "state.json")
+LUA_PATH = os.path.join(RUNTIME_DIR, "hyprland.lua")
+# {screen name: [workspace ids]}, read by the displays-workspaces bar widget.
+LAYOUT_PATH = os.path.join(RUNTIME_DIR, "layout.json")
+# Kept across sessions: the refresh rate gaming mode last used.
+SETTINGS_PATH = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "omarchy/plugins/displays/settings.json",
+)
+MONITORS_LUA = os.path.expanduser("~/.config/hypr/monitors.lua")
+PLUGINS_DIR = os.path.expanduser("~/.config/omarchy/plugins")
+# Omarchy gives a plugin one bar widget, so the per-screen workspaces widget
+# ships in companion/ and is copied next to this plugin.
+COMPANION = "displays-workspaces"
+COMPANION_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "companion", COMPANION)
+
+GAMING_RESOLUTION = "1920x1080"
+COMMON_RESOLUTIONS = [
+    (3840, 2160), (3440, 1440), (2560, 1600), (2560, 1440), (2560, 1080), (1920, 1200),
+    (1920, 1080), (1680, 1050), (1600, 900), (1440, 900), (1366, 768), (1280, 1024),
+    (1280, 800), (1280, 720),
+]
+COMMON_RATES = [60, 75, 90, 100, 120, 144, 165, 240]
+SCALES = [1, 1.25, 4 / 3, 1.5, 1.6, 5 / 3, 1.75, 2, 2.5, 3]
+TRIAL_SECONDS = 15
+
+# Names and modes end up inside generated Lua, so only plain values pass.
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+MODE_RE = re.compile(r"^(\d+)x(\d+)@(\d+(?:\.\d+)?)$")
+INTERNAL_RE = re.compile(r"^(eDP|LVDS|DSI)-")
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def dispatch(expr):
+    hyprctl("dispatch", expr)
+
+
+def live_monitors():
+    mons = [m for m in json.loads(hyprctl("monitors", "all", "-j") or "[]") if NAME_RE.match(m["name"])]
+    return sorted(mons, key=lambda m: (m["x"], m["y"], m["name"]))
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    state.setdefault("primary", "auto")
+    state.setdefault("overrides", {})
+    state.setdefault("trials", {})
+    return state
+
+
+def write_file(path, text):
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def save_state(state):
+    write_file(STATE_PATH, json.dumps(state, indent=2) + "\n")
+
+
+def is_internal(mon):
+    return bool(INTERNAL_RE.match(mon["name"]))
+
+
+def position_for(mon):
+    # The leftmost screen stays put; the others line up to its right, so a
+    # screen that changes size or scale never overlaps its neighbour.
+    return "0x0" if (mon["x"], mon["y"]) == (0, 0) else "auto-right"
+
+
+def layout(mons, state):
+    """[(monitor name, workspace ids)] for the enabled screens, primary first."""
+    enabled = [m for m in mons if not m.get("disabled")]
+    if not enabled:
+        return []
+    by_name = {m["name"]: m for m in enabled}
+    primary = by_name.get(state["primary"])
+    if primary is None:
+        externals = [m for m in enabled if not is_internal(m)]
+        primary = (externals or enabled)[0]
+    others = [m for m in enabled if m is not primary]
+    if not others:
+        return [(primary["name"], list(range(1, 11)))]
+    return [(primary["name"], list(range(1, 6))), (others[0]["name"], list(range(6, 11)))]
+
+
+def render_lua(mons, state, plan):
+    lines = [
+        "-- Generated by displays-ctl (Omarchy displays plugin). Do not edit:",
+        "-- it is rewritten whenever a screen is plugged in or a mode changes.",
+    ]
+    present = {m["name"] for m in mons}
+    for name, o in sorted(state["overrides"].items()):
+        position = o.get("position", "auto-right")
+        if (name in present and NAME_RE.match(name) and MODE_RE.match(o["mode"])
+                and re.match(r"^(\d+x\d+|auto-right)$", position)):
+            lines.append(
+                f'hl.monitor({{ output = "{name}", mode = "{o["mode"]}", '
+                f'position = "{position}", scale = {float(o["scale"]):.6g} }})'
+            )
+    for name, ids in plan:
+        for i, ws in enumerate(ids):
+            default = ", default = true" if i == 0 else ""
+            lines.append(f'hl.workspace_rule({{ workspace = "{ws}", monitor = "{name}"{default} }})')
+    return "\n".join(lines) + "\n"
+
+
+def move_workspaces(plan):
+    # Rules only place workspaces when they are created; existing ones move here.
+    target = {ws: name for name, ids in plan for ws in ids}
+    for ws in json.loads(hyprctl("workspaces", "-j") or "[]"):
+        dest = target.get(ws["id"])
+        if dest and ws["monitor"] != dest:
+            dispatch(f'hl.dsp.workspace.move({{ workspace = "{ws["id"]}", monitor = "{dest}" }})')
+
+    # Each screen should show one of its own workspaces, then focus goes back
+    # to where it was (that workspace may now be on another screen).
+    focused = json.loads(hyprctl("activeworkspace", "-j") or "{}").get("id")
+    showing = {m["name"]: m["activeWorkspace"]["id"] for m in live_monitors() if not m.get("disabled")}
+    for name, ids in plan:
+        if showing.get(name) not in ids:
+            dispatch(f'hl.dsp.focus({{ workspace = "{ids[0]}" }})')
+    if focused:
+        dispatch(f'hl.dsp.focus({{ workspace = "{focused}" }})')
+
+
+def apply(state=None, force_reload=False):
+    state = state or load_state()
+    mons = live_monitors()
+    plan = layout(mons, state)
+    text = render_lua(mons, state, plan)
+    try:
+        with open(LUA_PATH) as f:
+            changed = f.read() != text
+    except OSError:
+        changed = True
+    if changed:
+        write_file(LUA_PATH, text)
+    if changed or force_reload:
+        hyprctl("reload")
+    move_workspaces(plan)
+
+    # Written in place rather than replaced, so the bar widgets' file watch
+    # keeps following it.
+    layout_text = json.dumps({name: ids for name, ids in plan}) + "\n"
+    try:
+        with open(LAYOUT_PATH) as f:
+            same = f.read() == layout_text
+    except OSError:
+        same = False
+    if not same:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(LAYOUT_PATH, "w") as f:
+            f.write(layout_text)
+
+
+def find_monitor(name):
+    for m in live_monitors():
+        if m["name"] == name:
+            return m
+    sys.exit(f"displays-ctl: no screen named {name!r}")
+
+
+# ---------------------------------------------------------------- modes
+
+
+def reported_modes(mon):
+    """{(w, h): {rounded hz: (hz, mode)}} from what the screen reports."""
+    by_res = {}
+    for spec in mon.get("availableModes", []):
+        spec = spec.removesuffix("Hz")
+        match = MODE_RE.match(spec)
+        if not match:
+            continue
+        w, h, hz = int(match[1]), int(match[2]), float(match[3])
+        rates = by_res.setdefault((w, h), {})
+        # 60.00 and 59.94 both read as 60 Hz; keep the faster one.
+        key = round(hz)
+        if key not in rates or hz > rates[key][0]:
+            rates[key] = (hz, spec)
+    return by_res
+
+
+def modes_of(mon):
+    """Resolutions, largest first, each with its refresh rates, fastest first.
+
+    The screen's own modes, plus the common ones it can plausibly drive: no
+    larger than its biggest mode, no faster than its fastest rate, and no more
+    pixels per second than it already shows (the link has to carry them).
+    Those are marked custom.
+    """
+    reported = reported_modes(mon)
+    if not reported:
+        return []
+    max_w = max(w for w, _ in reported)
+    max_h = max(h for _, h in reported)
+    max_hz = max(key for rates in reported.values() for key in rates)
+    budget = max(w * h * hz for (w, h), rates in reported.items() for hz, _ in rates.values())
+
+    sizes = {r for r in reported if r[0] >= 1280}
+    sizes |= {r for r in COMMON_RESOLUTIONS if r[0] <= max_w and r[1] <= max_h}
+
+    out = []
+    for w, h in sorted(sizes, key=lambda r: (r[0] * r[1], r[0]), reverse=True):
+        rates = {key: {"hz": key, "mode": spec, "custom": False}
+                 for key, (_, spec) in reported.get((w, h), {}).items()}
+        for hz in COMMON_RATES:
+            if hz not in rates and hz <= max_hz and w * h * hz <= budget * 1.001:
+                rates[hz] = {"hz": hz, "mode": f"{w}x{h}@{hz}", "custom": True}
+        out.append({
+            "resolution": f"{w}x{h}",
+            "custom": (w, h) not in reported,
+            "rates": sorted(rates.values(), key=lambda r: r["hz"], reverse=True),
+        })
+    return out
+
+
+def offered(mon, mode):
+    for res in modes_of(mon):
+        for rate in res["rates"]:
+            if rate["mode"] == mode:
+                return rate
+    return None
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def gaming_hz():
+    return int(load_settings().get("gamingHz", 60))
+
+
+def set_gaming(name, hz=None):
+    mon = find_monitor(name)
+    rates = next((r["rates"] for r in modes_of(mon) if r["resolution"] == GAMING_RESOLUTION), [])
+    if not rates:
+        sys.exit(f"displays-ctl: {name} has no {GAMING_RESOLUTION} mode")
+    if hz is not None:
+        settings = load_settings()
+        settings["gamingHz"] = int(hz)
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+    wanted = int(hz) if hz is not None else gaming_hz()
+    # The closest rate the screen offers at 1080p, e.g. 90 Hz on a 90 Hz laptop;
+    # on a tie, the one the screen reports itself.
+    best = min(rates, key=lambda r: (abs(r["hz"] - wanted), r["custom"]))
+    set_mode(name, best["mode"], gaming=True)
+
+
+def set_mode(name, mode, gaming=False):
+    mon = find_monitor(name)
+    rate = offered(mon, mode)
+    if rate is None:
+        sys.exit(f"displays-ctl: {name} does not offer {mode!r}")
+    match = MODE_RE.match(mode)
+    w, h = int(match[1]), int(match[2])
+
+    state = load_state()
+    trial = state["trials"].get(name)
+    # What to go back to if a custom mode does not work out: the state before
+    # the first untried change.
+    previous = trial["previous"] if trial else state["overrides"].get(name)
+    # Remember the configured resolution and scale before the first change, so
+    # the native resolution keeps its scale and anything else runs at 1.
+    normal = state["overrides"].get(name, {}).get("normal") or {
+        "width": mon["width"], "height": mon["height"], "scale": mon["scale"],
+    }
+    native = (w, h) == (normal["width"], normal["height"])
+    state["overrides"][name] = {
+        "mode": mode,
+        "position": position_for(mon),
+        "scale": normal["scale"] if native else 1,
+        "normal": normal,
+        "gaming": gaming,
+    }
+    token = secrets.token_hex(4)
+    if rate["custom"]:
+        state["trials"][name] = {"token": token, "deadline": time.time() + TRIAL_SECONDS, "previous": previous}
+    else:
+        state["trials"].pop(name, None)
+    save_state(state)
+    apply(state)
+
+    if not rate["custom"]:
+        return
+    # Hyprland falls back to another mode when the screen refuses a custom one.
+    now = find_monitor(name)
+    if (now["width"], now["height"]) != (w, h) or abs(now["refreshRate"] - rate["hz"]) > 1.5:
+        restore(name, token)
+        sys.exit(f"displays-ctl: {name} refused {mode}")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "revert", name, token],
+        start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def restore(name, token):
+    state = load_state()
+    trial = state["trials"].get(name)
+    if not trial or trial["token"] != token:
+        return
+    del state["trials"][name]
+    if trial["previous"]:
+        state["overrides"][name] = trial["previous"]
+    else:
+        state["overrides"].pop(name, None)
+    save_state(state)
+    apply(state)
+
+
+def revert_later(name, token):
+    time.sleep(TRIAL_SECONDS)
+    restore(name, token)
+
+
+def undo(name):
+    trial = load_state()["trials"].get(name)
+    if trial:
+        restore(name, trial["token"])
+
+
+def keep(name):
+    state = load_state()
+    if state["trials"].pop(name, None) is not None:
+        save_state(state)
+
+
+def set_normal(name):
+    state = load_state()
+    state["trials"].pop(name, None)
+    state["overrides"].pop(name, None)
+    save_state(state)
+    apply(state)
+
+
+# ---------------------------------------------------------------- scale
+
+
+def clean_scales(w, h):
+    """The scales Hyprland accepts for a WxH mode: whole logical pixels, in
+    1/120 steps."""
+    g = math.gcd(w * 120, h * 120)
+    return [k / 120 for k in (round(s * 120) for s in SCALES) if g % k == 0]
+
+
+def persist_scale(mon, scale):
+    """Rewrite the scale on the screen's line in monitors.lua, if it has one."""
+    try:
+        with open(MONITORS_LUA) as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return False
+    targets = (f'output = "{mon["name"]}"', f'output = "desc:{mon.get("description", "")}"')
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("hl.monitor(") and any(t in line for t in targets):
+            new = re.sub(r"scale = [0-9.]+", f"scale = {scale:.6g}", line)
+            if new == line and "scale = " not in line:
+                return False
+            lines[i] = new
+            with open(MONITORS_LUA, "w") as f:
+                f.write("\n".join(lines))
+            return True
+    return False
+
+
+def set_scale(name, value):
+    mon = find_monitor(name)
+    try:
+        wanted = float(value)
+    except ValueError:
+        sys.exit(f"displays-ctl: {value!r} is not a scale")
+    scale = next((s for s in clean_scales(mon["width"], mon["height"]) if abs(s - wanted) < 0.01), None)
+    if scale is None:
+        sys.exit(f"displays-ctl: {name} cannot use scale {value} at {mon['width']}x{mon['height']}")
+
+    state = load_state()
+    override = state["overrides"].get(name)
+    if override:
+        # A temporary mode keeps its own scale for as long as it lasts.
+        override["scale"] = scale
+        save_state(state)
+        apply(state)
+    elif persist_scale(mon, scale):
+        apply(state, force_reload=True)
+    else:
+        # A screen monitors.lua does not name: keep the scale for the session.
+        mode = next(
+            (r["mode"] for res in modes_of(mon) if res["resolution"] == f'{mon["width"]}x{mon["height"]}'
+             for r in res["rates"] if r["hz"] == round(mon["refreshRate"])),
+            None,
+        )
+        if mode is None:
+            sys.exit(f"displays-ctl: cannot tell {name}'s current mode")
+        state["overrides"][name] = {
+            "mode": mode, "position": position_for(mon), "scale": scale,
+            "normal": {"width": mon["width"], "height": mon["height"], "scale": mon["scale"]},
+            "gaming": False,
+        }
+        save_state(state)
+        apply(state)
+
+
+def sync_companion():
+    if not os.path.isdir(COMPANION_SRC):
+        return
+    dest = os.path.join(PLUGINS_DIR, COMPANION)
+    os.makedirs(dest, exist_ok=True)
+    for name in os.listdir(COMPANION_SRC):
+        src, dst = os.path.join(COMPANION_SRC, name), os.path.join(dest, name)
+        if not os.path.isfile(src):
+            continue
+        # Only what changed, so the shell does not reload the widget for nothing.
+        try:
+            with open(src, "rb") as a, open(dst, "rb") as b:
+                if a.read() == b.read():
+                    continue
+        except OSError:
+            pass
+        shutil.copyfile(src, dst)
+
+
+def set_primary(name):
+    if name != "auto":
+        find_monitor(name)
+    state = load_state()
+    state["primary"] = name
+    save_state(state)
+    apply(state)
+
+
+def state_json():
+    state = load_state()
+    mons = live_monitors()
+    plan = layout(mons, state)
+    primary = plan[0][0] if plan else ""
+    out = []
+    for m in mons:
+        override = state["overrides"].get(m["name"], {})
+        normal = override.get("normal") or {"width": m["width"], "height": m["height"]}
+        trial = state["trials"].get(m["name"])
+        out.append({
+            "name": m["name"],
+            "label": "Laptop screen" if is_internal(m) else (m.get("model") or m["name"]),
+            "internal": is_internal(m),
+            "enabled": not m.get("disabled"),
+            "resolution": f'{m["width"]}x{m["height"]}',
+            "normalResolution": f'{normal["width"]}x{normal["height"]}',
+            "hz": round(m["refreshRate"]),
+            "scale": round(m["scale"], 4),
+            "scales": [round(s, 4) for s in clean_scales(m["width"], m["height"])],
+            "primary": m["name"] == primary,
+            "workspaces": next((ids for name, ids in plan if name == m["name"]), []),
+            "overridden": bool(override),
+            "gaming": override.get("gaming", False),
+            "trial": max(0, round(trial["deadline"] - time.time())) if trial else 0,
+            "modes": modes_of(m),
+        })
+    print(json.dumps({"primary": state["primary"], "gamingHz": gaming_hz(), "monitors": out}))
+
+
+def main(argv):
+    cmd, args = (argv[0], argv[1:]) if argv else ("", [])
+    if cmd == "state" and not args:
+        state_json()
+    elif cmd == "apply" and not args:
+        apply()
+    elif cmd == "mode" and len(args) == 2:
+        set_mode(*args)
+    elif cmd == "gaming" and len(args) in (1, 2) and (len(args) == 1 or args[1].isdigit()):
+        set_gaming(*args)
+    elif cmd == "normal" and len(args) == 1:
+        set_normal(args[0])
+    elif cmd == "scale" and len(args) == 2:
+        set_scale(*args)
+    elif cmd == "keep" and len(args) == 1:
+        keep(args[0])
+    elif cmd == "undo" and len(args) == 1:
+        undo(args[0])
+    elif cmd == "revert" and len(args) == 2:
+        revert_later(*args)
+    elif cmd == "primary" and len(args) == 1:
+        set_primary(args[0])
+    elif cmd == "sync-companion" and not args:
+        sync_companion()
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
