@@ -99,7 +99,18 @@ BarWidget {
         root.layout = ({})
       }
     }
-    onLoadFailed: root.layout = ({})
+    onLoadFailed: {
+      root.layout = ({})
+      retry.restart()
+    }
+  }
+
+  // The bar can come up before displays-ctl has written layout.json, and a
+  // missing file is not watched: try again until it shows up.
+  Timer {
+    id: retry
+    interval: 1000
+    onTriggered: layoutFile.reload()
   }
 
   // Backstop for the file watch: the layout settles shortly after a hotplug.
