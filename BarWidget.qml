@@ -221,11 +221,6 @@ Panel {
 
   Process { id: focusProc }
 
-  Process {
-    id: displayPanelProc
-    command: ["omarchy-shell", "shell", "toggle", "omarchy.monitor"]
-  }
-
   // The service rearranges workspaces after a hotplug; catch up once it is done.
   Connections {
     target: Quickshell
@@ -284,35 +279,13 @@ Panel {
           spacing: Style.space(14)
 
           // ---------- Title ----------
-          Item {
-            width: parent.width
-            height: Math.max(title.implicitHeight, displayButton.implicitHeight)
-
-            Text {
-              id: title
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: "Displays"
-              color: root.fg
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-            }
-
-            PanelActionButton {
-              id: displayButton
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              iconText: "󰃟"
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              tooltipText: "Brightness, scale, screens on/off"
-              onClicked: {
-                root.close()
-                displayPanelProc.running = true
-              }
-            }
+          Text {
+            textFormat: Text.PlainText
+            text: "Displays"
+            color: root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
           }
 
           ButtonGroup {
@@ -678,7 +651,7 @@ Panel {
 
     Item {
       width: parent.width
-      height: Math.max(screenName.implicitHeight, makeMain.implicitHeight)
+      height: Math.max(screenName.implicitHeight, screenActions.implicitHeight)
 
       Row {
         id: screenName
@@ -716,13 +689,24 @@ Panel {
         }
       }
 
-      LinkButton {
-        id: makeMain
+      Row {
+        id: screenActions
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        visible: root.multi && screen.monitor.enabled && !screen.isMain
-        text: "Make main"
-        onClicked: root.runCtl(["primary", screen.monitor.name])
+        spacing: Style.space(2)
+
+        LinkButton {
+          visible: root.multi && screen.monitor.enabled && !screen.isMain
+          text: "Make main"
+          onClicked: root.runCtl(["primary", screen.monitor.name])
+        }
+
+        // Never offered on the last screen that is on.
+        LinkButton {
+          visible: screen.monitor.enabled ? root.multi : true
+          text: screen.monitor.enabled ? "Turn off" : "Turn on"
+          onClicked: root.runCtl(["power", screen.monitor.name, screen.monitor.enabled ? "off" : "on"])
+        }
       }
     }
 

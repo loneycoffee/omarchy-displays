@@ -11,6 +11,7 @@
   displays-ctl keep NAME               keep a custom mode being tried
   displays-ctl undo NAME               drop it now instead of waiting
   displays-ctl primary NAME|auto       which screen gets workspaces 1-5
+  displays-ctl power NAME on|off       turn a screen on or off (never the last one)
   displays-ctl sync-companion          install or refresh the workspaces bar widget
 
 The primary screen gets workspaces 1-5 and the next one 6-10; unless chosen,
@@ -92,6 +93,7 @@ def load_state():
     state.setdefault("primary", "auto")
     state.setdefault("overrides", {})
     state.setdefault("trials", {})
+    state.setdefault("off", [])
     return state
 
 
@@ -147,6 +149,11 @@ def render_lua(mons, state, plan):
                 f'hl.monitor({{ output = "{name}", mode = "{o["mode"]}", '
                 f'position = "{position}", scale = {float(o["scale"]):.6g} }})'
             )
+    # Turned off from the panel. Written here rather than through hyprctl eval,
+    # which the next reload would forget.
+    for name in sorted(state["off"]):
+        if name in present and NAME_RE.match(name):
+            lines.append(f'hl.monitor({{ output = "{name}", disabled = true }})')
     for name, ids in plan:
         for i, ws in enumerate(ids):
             default = ", default = true" if i == 0 else ""
@@ -475,6 +482,29 @@ def sync_companion():
         shutil.copyfile(src, dst)
 
 
+def set_power(name, power):
+    mon = find_monitor(name)
+    state = load_state()
+    if power == "off":
+        others = [m for m in live_monitors() if not m.get("disabled") and m["name"] != name]
+        if not others:
+            sys.exit(f"displays-ctl: {name} is the only screen on")
+        if name not in state["off"]:
+            state["off"].append(name)
+    else:
+        if name in state["off"]:
+            state["off"].remove(name)
+        elif mon.get("disabled"):
+            # Turned off by something else (e.g. Omarchy's lid handling): ask
+            # Hyprland directly, monitors.lua takes over at the next reload.
+            expr = f'hl.monitor({{ output = "{name}", disabled = false, mode = "preferred", position = "auto", scale = "auto" }})'
+            hyprctl("eval", expr)
+    save_state(state)
+    # The rest of the layout is computed from the screens that are on, so
+    # apply against the new set.
+    apply(state, force_reload=True)
+
+
 def set_primary(name):
     if name != "auto":
         find_monitor(name)
@@ -499,6 +529,7 @@ def state_json():
             "label": "Laptop screen" if is_internal(m) else (m.get("model") or m["name"]),
             "internal": is_internal(m),
             "enabled": not m.get("disabled"),
+            "off": m["name"] in state["off"],
             "resolution": f'{m["width"]}x{m["height"]}',
             "normalResolution": f'{normal["width"]}x{normal["height"]}',
             "hz": round(m["refreshRate"]),
@@ -536,6 +567,8 @@ def main(argv):
         revert_later(*args)
     elif cmd == "primary" and len(args) == 1:
         set_primary(args[0])
+    elif cmd == "power" and len(args) == 2 and args[1] in ("on", "off"):
+        set_power(*args)
     elif cmd == "sync-companion" and not args:
         sync_companion()
     else:

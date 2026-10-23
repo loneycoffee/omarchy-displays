@@ -27,8 +27,13 @@ A small Omarchy shell plugin for a laptop that often has a second screen.
   (1–5 on the main one, 6–0 on the other) behind a laptop or monitor glyph,
   each number followed by the icons of its apps.
 
-Brightness and turning screens on or off are left to Omarchy's own *Display*
-widget (the ☀ button in the panel opens it).
+- **Screens on and off** from their row in the panel; the last screen that is
+  on cannot be turned off. It stays off across Hyprland reloads, until you turn
+  it back on or the session ends.
+
+With this, Omarchy's own *Display* widget can come off the bar
+(`omarchy plugin disable omarchy.monitor`); brightness stays on the keyboard
+keys.
 
 ## Install
 
@@ -64,6 +69,14 @@ plugin owns them) and give the screens to the right of the first one
 `position = "auto-right"`, so a screen that changes size or scale never
 overlaps its neighbour.
 
+To open the panel with the key Omarchy uses for its Display panel, add to
+`~/.config/hypr/bindings.lua`:
+
+```lua
+hl.unbind("SUPER + CTRL + D")
+o.bind("SUPER + CTRL + D", "Displays", "omarchy-shell shell toggle displays")
+```
+
 Update with `omarchy plugin update displays`.
 
 ## Command line
@@ -79,6 +92,7 @@ displays-ctl scale NAME SCALE        e.g. 1.25, saved in monitors.lua
 displays-ctl keep|undo NAME          keep or drop a custom mode being tried
 displays-ctl normal NAME             back to the mode from monitors.lua
 displays-ctl primary NAME|auto       which screen gets workspaces 1-5
+displays-ctl power NAME on|off       turn a screen on or off (never the last one)
 displays-ctl sync-companion          install or refresh the workspaces bar widget
 ```
 
