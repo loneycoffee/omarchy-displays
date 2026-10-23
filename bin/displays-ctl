@@ -4,8 +4,6 @@
   displays-ctl state                   JSON for the bar panel
   displays-ctl apply                   rewrite the Hyprland rules, move workspaces
   displays-ctl mode NAME WxH@HZ        switch a screen's mode
-  displays-ctl gaming NAME [HZ]        gaming mode: 1920x1080 at HZ (default: the
-                                       last rate used, first time 60)
   displays-ctl normal NAME             back to the mode from monitors.lua
   displays-ctl scale NAME SCALE        app scale, e.g. 1.25 (kept in monitors.lua)
   displays-ctl keep NAME               keep a custom mode being tried
@@ -43,11 +41,6 @@ STATE_PATH = os.path.join(RUNTIME_DIR, "state.json")
 LUA_PATH = os.path.join(RUNTIME_DIR, "hyprland.lua")
 # {screen name: [workspace ids]}, read by the displays-workspaces bar widget.
 LAYOUT_PATH = os.path.join(RUNTIME_DIR, "layout.json")
-# Kept across sessions: the refresh rate gaming mode last used.
-SETTINGS_PATH = os.path.join(
-    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-    "omarchy/plugins/displays/settings.json",
-)
 MONITORS_LUA = os.path.expanduser("~/.config/hypr/monitors.lua")
 PLUGINS_DIR = os.path.expanduser("~/.config/omarchy/plugins")
 # Omarchy gives a plugin one bar widget, so the per-screen workspaces widget
@@ -55,7 +48,6 @@ PLUGINS_DIR = os.path.expanduser("~/.config/omarchy/plugins")
 COMPANION = "displays-workspaces"
 COMPANION_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "companion", COMPANION)
 
-GAMING_RESOLUTION = "1920x1080"
 COMMON_RESOLUTIONS = [
     (3840, 2160), (3440, 1440), (2560, 1600), (2560, 1440), (2560, 1080), (1920, 1200),
     (1920, 1080), (1680, 1050), (1600, 900), (1440, 900), (1366, 768), (1280, 1024),
@@ -279,38 +271,7 @@ def offered(mon, mode):
     return None
 
 
-def load_settings():
-    try:
-        with open(SETTINGS_PATH) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def gaming_hz():
-    return int(load_settings().get("gamingHz", 60))
-
-
-def set_gaming(name, hz=None):
-    mon = find_monitor(name)
-    rates = next((r["rates"] for r in modes_of(mon) if r["resolution"] == GAMING_RESOLUTION), [])
-    if not rates:
-        sys.exit(f"displays-ctl: {name} has no {GAMING_RESOLUTION} mode")
-    if hz is not None:
-        settings = load_settings()
-        settings["gamingHz"] = int(hz)
-        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-        with open(SETTINGS_PATH, "w") as f:
-            json.dump(settings, f, indent=2)
-            f.write("\n")
-    wanted = int(hz) if hz is not None else gaming_hz()
-    # The closest rate the screen offers at 1080p, e.g. 90 Hz on a 90 Hz laptop;
-    # on a tie, the one the screen reports itself.
-    best = min(rates, key=lambda r: (abs(r["hz"] - wanted), r["custom"]))
-    set_mode(name, best["mode"], gaming=True)
-
-
-def set_mode(name, mode, gaming=False):
+def set_mode(name, mode):
     mon = find_monitor(name)
     rate = offered(mon, mode)
     if rate is None:
@@ -334,7 +295,6 @@ def set_mode(name, mode, gaming=False):
         "position": position_for(mon),
         "scale": normal["scale"] if native else 1,
         "normal": normal,
-        "gaming": gaming,
     }
     token = secrets.token_hex(4)
     if rate["custom"]:
@@ -457,7 +417,6 @@ def set_scale(name, value):
         state["overrides"][name] = {
             "mode": mode, "position": position_for(mon), "scale": scale,
             "normal": {"width": mon["width"], "height": mon["height"], "scale": mon["scale"]},
-            "gaming": False,
         }
         save_state(state)
         apply(state)
@@ -538,11 +497,10 @@ def state_json():
             "primary": m["name"] == primary,
             "workspaces": next((ids for name, ids in plan if name == m["name"]), []),
             "overridden": bool(override),
-            "gaming": override.get("gaming", False),
             "trial": max(0, round(trial["deadline"] - time.time())) if trial else 0,
             "modes": modes_of(m),
         })
-    print(json.dumps({"primary": state["primary"], "gamingHz": gaming_hz(), "monitors": out}))
+    print(json.dumps({"primary": state["primary"], "monitors": out}))
 
 
 def main(argv):
@@ -553,8 +511,6 @@ def main(argv):
         apply()
     elif cmd == "mode" and len(args) == 2:
         set_mode(*args)
-    elif cmd == "gaming" and len(args) in (1, 2) and (len(args) == 1 or args[1].isdigit()):
-        set_gaming(*args)
     elif cmd == "normal" and len(args) == 1:
         set_normal(args[0])
     elif cmd == "scale" and len(args) == 2:

@@ -8,9 +8,6 @@ A small Omarchy shell plugin for a laptop that often has a second screen.
   the other one 6–10. Unless you pick one, the main screen is the external
   screen, so plugging one in moves 1–5 onto it; unplugging brings everything
   back to the laptop.
-- **Gaming mode in one switch**: 1920×1080 at the rate you pick next to it
-  (60 Hz until you choose another; the choice is remembered). On a screen
-  without that rate it takes the closest one.
 - **Resolution, refresh rate and scale dropdowns**, applied as soon as you
   pick. Besides the modes the screen reports, the common resolutions and rates
   it can plausibly drive are listed as *custom* (no bigger, faster or heavier
@@ -87,7 +84,6 @@ Everything goes through `bin/displays-ctl`, which the panel and the service call
 displays-ctl state                   JSON for the bar panel
 displays-ctl apply                   rewrite the Hyprland rules, move workspaces
 displays-ctl mode NAME WxH@HZ        e.g. displays-ctl mode HDMI-A-1 1920x1080@119.88
-displays-ctl gaming NAME [HZ]        1920x1080 at HZ (default: the last one, first 60)
 displays-ctl scale NAME SCALE        e.g. 1.25, saved in monitors.lua
 displays-ctl keep|undo NAME          keep or drop a custom mode being tried
 displays-ctl normal NAME             back to the mode from monitors.lua

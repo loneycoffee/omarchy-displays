@@ -6,9 +6,8 @@ import Quickshell.Hyprland
 import qs.Ui
 import qs.Commons
 
-// Bar entry and popup for the Displays plugin. Three quiet sections:
+// Bar entry and popup for the Displays plugin. Two quiet sections:
 //
-//   Gaming mode   one switch: 1920x1080 at the rate picked below (60 Hz first)
 //   Display mode  resolution and refresh rate dropdowns, applied on change
 //   Workspaces    each screen with a tile per workspace showing its apps' icons
 //
@@ -23,7 +22,6 @@ Panel {
 
   property var monitors: []
   property string primaryChoice: "auto"
-  property int gamingHz: 60
   property string selectedName: ""
 
   readonly property var enabledMonitors: root.monitors.filter(function(m) { return m.enabled })
@@ -49,10 +47,6 @@ Panel {
     return ka - kb
   })
   readonly property bool anyOverride: root.monitors.some(function(m) { return m.overridden })
-  // The rates people actually game at, among those the screen can do at 1080p.
-  readonly property var gamingRates: root.ratesFor("1920x1080").filter(function(r) {
-    return [60, 120, 144, 165, 240].indexOf(r.hz) !== -1
-  })
 
   // Seconds left before a custom mode being tried goes back on its own.
   property int trialLeft: 0
@@ -171,7 +165,6 @@ Panel {
           var parsed = JSON.parse(String(text || "{}"))
           root.monitors = parsed.monitors || []
           root.primaryChoice = parsed.primary || "auto"
-          root.gamingHz = parsed.gamingHz || 60
         } catch (e) {
           root.monitors = []
         }
@@ -300,75 +293,6 @@ Panel {
             onChanged: function(value) { root.selectedName = value }
           }
 
-          // ---------- Gaming mode ----------
-          Column {
-            width: parent.width
-            spacing: Style.space(8)
-            visible: root.gamingRates.length > 0
-
-            PanelSeparator { foreground: root.fg }
-
-            Item {
-              width: parent.width
-              height: Math.max(gamingHeader.implicitHeight, gamingSwitch.implicitHeight)
-
-              PanelSectionHeader {
-                id: gamingHeader
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: "GAMING MODE"
-                foreground: root.fg
-                fontFamily: root.fontFamily
-              }
-
-              ToggleSwitch {
-                id: gamingSwitch
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                checked: !!root.selected && root.selected.gaming
-                busy: actionProc.running
-                foreground: root.fg
-                onToggled: {
-                  if (!root.selected) return
-                  if (root.selected.gaming) root.runCtl(["normal", root.selected.name])
-                  else root.runCtl(["gaming", root.selected.name])
-                }
-              }
-            }
-
-            Row {
-              spacing: Style.space(10)
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: "1920×1080 at"
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-
-              // Picking a rate turns gaming mode on at that rate, and it stays
-              // the rate for next time.
-              ButtonGroup {
-                anchors.verticalCenter: parent.verticalCenter
-                options: root.gamingRates.map(function(r) { return { value: String(r.hz), label: r.hz + " Hz" } })
-                value: {
-                  if (root.selected && root.selected.gaming) return String(root.selected.hz)
-                  var best = root.gamingRates.length > 0 ? root.gamingRates[0].hz : 0
-                  for (var i = 0; i < root.gamingRates.length; i++) {
-                    if (Math.abs(root.gamingRates[i].hz - root.gamingHz) < Math.abs(best - root.gamingHz)) best = root.gamingRates[i].hz
-                  }
-                  return String(best)
-                }
-                foreground: root.fg
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                onChanged: function(value) { if (root.selected) root.runCtl(["gaming", root.selected.name, value]) }
-              }
-            }
-          }
-
           // ---------- Display mode ----------
           Column {
             width: parent.width
@@ -394,7 +318,7 @@ Panel {
                 id: normalLink
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                visible: !!root.selected && root.selected.overridden && !root.selected.gaming
+                visible: !!root.selected && root.selected.overridden
                 text: "Back to normal"
                 onClicked: root.runCtl(["normal", root.selected.name])
               }

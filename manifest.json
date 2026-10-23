@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "loneycoffee",
   "license": "MIT",
-  "description": "Workspaces 1-5 follow the screen you plug in (the main screen) and 6-10 go to the other one, and a bar panel switches a screen's resolution and refresh rate among the modes it really offers, e.g. 1080p for gaming, with one click back to normal. Toggle the panel with: omarchy-shell shell toggle displays",
+  "description": "Workspaces 1-5 follow the screen you plug in (the main screen) and 6-10 go to the other one, and a bar panel switches a screen's resolution and refresh rate among the modes it really offers, with one click back to normal. Toggle the panel with: omarchy-shell shell toggle displays",
   "kinds": [
     "service",
     "bar-widget"
