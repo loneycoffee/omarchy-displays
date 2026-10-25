@@ -126,12 +126,100 @@ Panel {
     return ipc && ipc["class"] ? String(ipc["class"]) : ""
   }
 
-  function iconFor(appId) {
+  // Web app host -> icon, from the launchers that open a URL (Omarchy's
+  // "omarchy-launch-webapp https://..." entries, including the ones that are
+  // not installed in ~/.local/share/applications).
+  property var webIcons: ({})
+
+  function hasIcon(name) {
+    if (!name) return false
+    if (name.charAt(0) === "/") return true
+    if (root.appLibrary && root.appLibrary.iconIndex[name]) return true
+    return Quickshell.iconPath(name, true).length > 0
+  }
+
+  function sourceOf(icon) {
+    return root.appLibrary ? root.appLibrary.iconSource(icon) : Quickshell.iconPath(icon || "application-x-executable", true)
+  }
+
+  // Chromium-family web apps get a class like brave-web.whatsapp.com__-Default.
+  function webHostOf(appId) {
+    var m = /^(?:google-chrome[a-z-]*|chromium|chrome|brave|microsoft-edge[a-z-]*|msedge|vivaldi[a-z-]*|opera|helium)-([^_]+)__/.exec(appId)
+    return m ? m[1].toLowerCase() : ""
+  }
+
+  function webIconFor(host) {
+    // web.whatsapp.com, then whatsapp.com: a launcher on either matches.
+    for (var h = host; h.indexOf(".") !== -1; h = h.slice(h.indexOf(".") + 1)) {
+      if (root.webIcons[h] && root.hasIcon(root.webIcons[h])) return root.webIcons[h]
+    }
+    // No launcher: try the site's name as an icon (whatsapp, youtube, ...).
+    var labels = host.split(".").slice(0, -1).filter(function(l) { return !/^(www|web|app|m|mobile)$/.test(l) })
+    for (var i = labels.length - 1; i >= 0; i--) {
+      if (root.hasIcon(labels[i])) return labels[i]
+      if (i > 0 && root.hasIcon(labels[i] + "-" + labels[i - 1])) return labels[i] + "-" + labels[i - 1]
+    }
+    return ""
+  }
+
+  function entryIcon(appId) {
     var entry = DesktopEntries.heuristicLookup(appId)
+    return entry && root.hasIcon(entry.icon) ? entry.icon : ""
+  }
+
+  function iconFor(appId) {
+    var icon = ""
+    var host = root.webHostOf(appId)
+    if (host) icon = root.webIconFor(host) || root.entryIcon(appId.split("-")[0])
+
+    // Steam games run as steam_app_<id>; Steam installs steam_icon_<id>.
+    var game = /^steam_app_(\d+)$/.exec(appId)
+    if (!icon && game) icon = root.hasIcon("steam_icon_" + game[1]) ? "steam_icon_" + game[1] : "steam"
+
+    if (!icon) icon = root.entryIcon(appId)
+
     // Omarchy's TUIs run in the terminal under app-ids like TUI.finder.
-    if (!entry && /^(TUI\.|org\.omarchy\.)/.test(appId)) entry = DesktopEntries.heuristicLookup("foot")
-    var icon = entry && entry.icon ? entry.icon : appId.toLowerCase()
-    return root.appLibrary ? root.appLibrary.iconSource(icon) : Quickshell.iconPath(icon, true)
+    if (!icon && /^(TUI\.|org\.omarchy\.)/.test(appId)) icon = root.entryIcon("foot")
+
+    if (!icon) {
+      // Last resorts: the app-id itself, its last reverse-DNS part, or its
+      // first word (org.gnome.Nautilus -> nautilus, gimp-2.10 -> gimp).
+      var lower = appId.toLowerCase()
+      var candidates = [lower, lower.split(".").pop(), lower.split(/[-_ .]/)[0], lower.replace(/\.desktop$/, "")]
+      for (var i = 0; i < candidates.length && !icon; i++) {
+        if (root.hasIcon(candidates[i])) icon = candidates[i]
+        else icon = root.entryIcon(candidates[i])
+      }
+    }
+    return root.sourceOf(icon)
+  }
+
+  Process {
+    id: webScan
+    running: true
+    command: ["bash", "-c",
+      'for f in "${OMARCHY_PATH:-/usr/share/omarchy}"/applications/*.desktop /usr/share/applications/*.desktop "$HOME"/.local/share/applications/*.desktop; do ' +
+      '[ -f "$f" ] && awk \'/^Exec=/ && !e { e = $0 } /^Icon=/ && !i { i = substr($0, 6) } ' +
+      'END { if (i != "" && match(e, /https?:\\/\\/[^\\/ "%]+/)) print substr(e, RSTART, RLENGTH) "\\t" i }\' "$f"; done']
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var next = ({})
+        var lines = text.split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var parts = lines[i].split("\t")
+          if (parts.length < 2) continue
+          next[parts[0].replace(/^https?:\/\//, "").toLowerCase()] = parts[1]
+        }
+        root.webIcons = next
+      }
+    }
+  }
+
+  // New launchers (a web app just installed) and new icons show up live.
+  Connections {
+    target: root.appLibrary
+    ignoreUnknownSignals: true
+    function onAppsChanged() { webScan.running = true }
   }
 
   // One icon per app on the workspace, in window order.
